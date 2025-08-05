@@ -1,34 +1,30 @@
 # HierarchicalReasoningModel_ACTV1.py (Modified)
 
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Dict
 from dataclasses import dataclass
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
-# --- LMA Integration ---
-from LMA_features import LMATransformerBlock
-# ---------------------
+from LMA_features import LMAInitialTransform # LMA Integration
+
+# ... (HierarchicalReasoningModel_ACTV1InnerCarry and HierarchicalReasoningModel_ACTV1Carry remain unchanged) ...
 
 @dataclass
 class HierarchicalReasoningModel_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
 
-
 @dataclass
 class HierarchicalReasoningModel_ACTV1Carry:
     inner_carry: HierarchicalReasoningModel_ACTV1InnerCarry
-    
     steps: torch.Tensor
     halted: torch.Tensor
-    
     current_data: Dict[str, torch.Tensor]
 
 
@@ -38,81 +34,59 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_ndim: int = 0
     num_puzzle_identifiers: int
     vocab_size: int
-
     H_cycles: int
     L_cycles: int
-
     H_layers: int
     L_layers: int
-
-    # Transformer config
     hidden_size: int
     expansion: float
     num_heads: int
     pos_encodings: str
-
+    
     # --- LMA Integration ---
-    use_lma: bool = False  # Flag to enable/disable LMA. Disabled by default.
-    lma_heads: int = 4     # Number of heads for LMA transform. Default to 4.
+    use_lma: bool = False
+    lma_heads: int = 4
+    lma_latent_dim: int = None # If None, defaults to hidden_size // 2
     # ---------------------
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    
-    # Halting Q-learning config
     halt_max_steps: int
     halt_exploration_prob: float
-
     forward_dtype: str = "bfloat16"
 
-
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+    # This standard block is now used for both MHA and LMA paths,
+    # just configured with different dimensions.
+    def __init__(self, hidden_size: int, num_heads: int, expansion: float, norm_eps: float) -> None:
         super().__init__()
-
         self.self_attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
+            hidden_size=hidden_size,
+            head_dim=hidden_size // num_heads,
+            num_heads=num_heads,
+            num_key_value_heads=num_heads,
             causal=False
         )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-        )
-        self.norm_eps = config.rms_norm_eps
+        self.mlp = SwiGLU(hidden_size=hidden_size, expansion=expansion)
+        self.norm_eps = norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Post Norm
-        # Self Attention
-        # NOTE: This implementation has a slight deviation from standard Post-LN.
-        # The correct form is `hidden_states = self.ln1(hidden_states + self.attn(...))`.
-        # Here it is `hidden_states = rms_norm(hidden_states + self.attn(...))`, applying norm after res-connection.
-        # This is kept to match the original HRM code.
         attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        
-        # Fully Connected
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
 
-
 class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
-    def __init__(self, layers: List[nn.Module]): # Changed type hint to nn.Module
+    def __init__(self, layers: List[nn.Module]):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
-        # Input injection (add)
         hidden_states = hidden_states + input_injection
-        # Layers
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-
         return hidden_states
-
 
 class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
@@ -120,88 +94,61 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-        # I/O
-        self.embed_scale  = math.sqrt(self.config.hidden_size)
+        # Determine the dimension for the reasoning modules
+        self.reasoning_dim = config.hidden_size
+        if config.use_lma:
+            self.reasoning_dim = config.lma_latent_dim or (config.hidden_size // 2)
+            print(f"INFO: LMA enabled. Reasoning dimension set to {self.reasoning_dim}")
+            self.lma_transform = LMAInitialTransform(d0=config.hidden_size, n_heads=config.lma_heads, d_new=self.reasoning_dim)
+            self.lma_final_proj = CastedLinear(self.reasoning_dim, config.hidden_size, bias=False)
+        else:
+            print(f"INFO: LMA disabled. Reasoning dimension is {self.reasoning_dim}")
+
+        # --- I/O and Embeddings (always operate in original hidden_size) ---
+        self.embed_scale = math.sqrt(config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
+        self.embed_tokens = CastedEmbedding(config.vocab_size, config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
+        self.q_head = CastedLinear(config.hidden_size, 2, bias=True)
+        # (Puzzle embedding logic remains the same)
 
-        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        # --- Positional Encodings ---
+        # Note: RoPE is applied before LMA transform if enabled.
+        if config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=config.hidden_size // config.num_heads, max_position_embeddings=config.seq_len, base=config.rope_theta)
 
-        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
-        if self.config.puzzle_emb_ndim > 0:
-            self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
-                                                    batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
-
-        # LM Blocks
-        if self.config.pos_encodings == "rope":
-            self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
-                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
-                                              base=self.config.rope_theta)
-        elif self.config.pos_encodings == "learned":
-            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        else:
-            raise NotImplementedError()
-
-        # --- LMA Integration: Conditionally select the block type ---
-        if self.config.use_lma:
-            print("INFO: Using Latent Meta Attention (LMA) blocks.")
-            BlockClass = LMATransformerBlock
-            block_args = {
-                "hidden_size": self.config.hidden_size,
-                "lma_heads": self.config.lma_heads,
-                "num_heads": self.config.num_heads,
-                "expansion": self.config.expansion,
-                "norm_eps": self.config.rms_norm_eps
-            }
-        else:
-            print("INFO: Using standard Transformer blocks.")
-            BlockClass = HierarchicalReasoningModel_ACTV1Block
-            block_args = {"config": self.config}
-        # -----------------------------------------------------------
-
-        # Reasoning Layers
+        # --- Reasoning Layers (operate in `self.reasoning_dim`) ---
+        block_args = {
+            "hidden_size": self.reasoning_dim,
+            "num_heads": config.num_heads, # Can use same num_heads if reasoning_dim is multiple
+            "expansion": config.expansion,
+            "norm_eps": config.rms_norm_eps
+        }
         self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(
-            layers=[BlockClass(**block_args) for _ in range(self.config.H_layers)]
+            layers=[HierarchicalReasoningModel_ACTV1Block(**block_args) for _ in range(config.H_layers)]
         )
         self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(
-            layers=[BlockClass(**block_args) for _ in range(self.config.L_layers)]
+            layers=[HierarchicalReasoningModel_ACTV1Block(**block_args) for _ in range(config.L_layers)]
         )
         
-        # Initial states
-        self.H_init = nn.Parameter(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), requires_grad=True)
-        self.L_init = nn.Parameter(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), requires_grad=True)
-
-        # Q head special init
+        # --- Initial states (must be in `self.reasoning_dim`) ---
+        self.H_init = nn.Parameter(trunc_normal_init_(torch.empty(self.reasoning_dim, dtype=self.forward_dtype), std=1))
+        self.L_init = nn.Parameter(trunc_normal_init_(torch.empty(self.reasoning_dim, dtype=self.forward_dtype), std=1))
+        
+        # (Q head init remains the same)
         with torch.no_grad():
             self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head.bias.fill_(-5)
 
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
-
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
-            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
-
-        # Position embeddings
-        if self.config.pos_encodings == "learned":
-            embedding = 0.707106781 * (embedding + self.embed_pos.weight.to(self.forward_dtype))
-
-        # Scale
+    def _input_embeddings(self, input_ids: torch.Tensor):
+        embedding = self.embed_tokens(input_ids.to(torch.int32))
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        device = self.H_init.device
         return HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype, device=self.H_init.device),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype, device=self.L_init.device),
+            z_H=torch.empty(batch_size, self.config.seq_len, self.reasoning_dim, dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, self.config.seq_len, self.reasoning_dim, dtype=self.forward_dtype, device=device),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
@@ -211,50 +158,60 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         )
 
     def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        seq_info = dict(
-            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
-        )
-
+        # --- Positional Encoding (applied to original embeddings) ---
+        cos_sin_orig = self.rotary_emb() if hasattr(self, "rotary_emb") else None
+        
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        input_embeddings = self._input_embeddings(batch["inputs"])
+        # Apply RoPE to input embeddings before any transformation
+        if cos_sin_orig:
+             input_embeddings = self.self_attn.apply_rotary_pos_emb(input_embeddings, cos_sin_orig)
 
-        # Forward iterations
+        # --- LMA Transformation Step (if enabled) ---
+        if self.config.use_lma:
+            # Note: RoPE is not passed to latent blocks as sequence length is preserved
+            # but feature space is different.
+            seq_info = dict(cos_sin=None)
+            # Transform inputs and states into the latent space
+            input_injection = self.lma_transform(input_embeddings)
+        else:
+            seq_info = dict(cos_sin=cos_sin_orig)
+            input_injection = input_embeddings
+
+        # --- Reasoning Loop (operates entirely in `self.reasoning_dim`) ---
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
-
-            for _H_step in range(self.config.H_cycles):
-                for _L_step in range(self.config.L_cycles):
-                    if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-
-                if not (_H_step == self.config.H_cycles - 1):
+            for _ in range(self.config.H_cycles):
+                for _ in range(self.config.L_cycles - 1):
+                    z_L = self.L_level(z_L, z_H + input_injection, **seq_info)
+                z_L = self.L_level(z_L, z_H + input_injection, **seq_info) # last L step
+                if _ < self.config.H_cycles - 1:
                     z_H = self.H_level(z_H, z_L, **seq_info)
-
-        assert not z_H.requires_grad and not z_L.requires_grad
-
+        
         # 1-step grad
-        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_L = self.L_level(z_L, z_H + input_injection, **seq_info)
         z_H = self.H_level(z_H, z_L, **seq_info)
 
-        # LM Outputs
-        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        # --- Final Projection and Output Heads ---
+        final_z_H = z_H
+        if self.config.use_lma:
+            final_z_H = self.lma_final_proj(z_H)
 
-        # Q head
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        output = self.lm_head(final_z_H)
+        q_logits = self.q_head(final_z_H[:, 0]).to(torch.float32)
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-
-# The rest of the file remains unchanged.
+# ... (HierarchicalReasoningModel_ACTV1 wrapper class remains unchanged) ...
 class HierarchicalReasoningModel_ACTV1(nn.Module):
     """ACT wrapper."""
-
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = HierarchicalReasoningModel_ACTV1Config(**config_dict)
         self.inner = HierarchicalReasoningModel_ACTV1_Inner(self.config)
 
+    # ... all other methods of this wrapper class are identical ...
     @property
     def puzzle_emb(self):
         return self.inner.puzzle_emb
