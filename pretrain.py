@@ -106,6 +106,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+    # This is the section to modify
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
 
@@ -114,7 +115,12 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
+        causal=False,  # Non-autoregressive
+
+        # --- LMA Integration: Pass flags from config ---
+        use_lma=config.arch.model_config.get('use_lma', False),
+        lma_heads=config.arch.model_config.get('lma_heads', 4)
+        # -----------------------------------------------
     )
 
     # Instantiate model with loss head
